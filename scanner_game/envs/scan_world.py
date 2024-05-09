@@ -1,22 +1,24 @@
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 import pygame
 import numpy as np
 
 
-class GridWorldEnv(gym.Env):
+class ScanWorldEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 4}
 
-    def __init__(self, render_mode=None, size=5):
-        self.size = size  # The size of the square grid
+    def __init__(self, render_mode=None, field_size=5, scan_radius=1, max_steps=200):
+        self.field_size = field_size  # The size of the square grid
+        self.scan_radius = scan_radius
         self.window_size = 512  # The size of the PyGame window
+        self.max_steps = max_steps
 
         # Observations are dictionaries with the agent's and the target's location.
         # Each location is encoded as an element of {0, ..., `size`}^2, i.e. MultiDiscrete([size, size]).
         self.observation_space = spaces.Dict(
             {
-                "agent": spaces.Box(0, size - 1, shape=(2,), dtype=int),
-                "target": spaces.Box(0, size - 1, shape=(2,), dtype=int),
+                "agent": spaces.Box(0, field_size - 1, shape=(2,), dtype=int),
+                "field": spaces.MultiBinary((field_size,field_size)),
             }
         )
 
@@ -49,13 +51,11 @@ class GridWorldEnv(gym.Env):
         self.clock = None
 
     def _get_obs(self):
-        return {"agent": self._agent_location, "target": self._target_location}
+        return {"agent": self._agent_location, "field": self._field_discovered}
 
     def _get_info(self):
         return {
-            "distance": np.linalg.norm(
-                self._agent_location - self._target_location, ord=1
-            )
+            "episode_reward": self.total_reward
         }
 
     def reset(self, seed=None, options=None):
@@ -63,14 +63,12 @@ class GridWorldEnv(gym.Env):
         super().reset(seed=seed)
 
         # Choose the agent's location uniformly at random
-        self._agent_location = self.np_random.integers(0, self.size, size=2, dtype=int)
+        self._agent_location = self.np_random.integers(0, self.field_size, size=2, dtype=int)
 
-        # We will sample the target's location randomly until it does not coincide with the agent's location
-        self._target_location = self._agent_location
-        while np.array_equal(self._target_location, self._agent_location):
-            self._target_location = self.np_random.integers(
-                0, self.size, size=2, dtype=int
-            )
+        self._field_discovered = np.zeros((self.field_size,self.field_size),dtype='int8')
+
+        self.steps_count = 0
+        self.total_reward = 0
 
         observation = self._get_obs()
         info = self._get_info()
@@ -85,18 +83,38 @@ class GridWorldEnv(gym.Env):
         direction = self._action_to_direction[action]
         # We use `np.clip` to make sure we don't leave the grid
         self._agent_location = np.clip(
-            self._agent_location + direction, 0, self.size - 1
+            self._agent_location + direction, 0, self.field_size - 1
         )
-        # An episode is done iff the agent has reached the target
-        terminated = np.array_equal(self._agent_location, self._target_location)
-        reward = 1 if terminated else 0  # Binary sparse rewards
+
+        old_field = np.copy(self._field_discovered)
+
+        r_lb = max(0, self._agent_location[0]-self.scan_radius)
+        r_ub = min(self.field_size-1, self._agent_location[0]+self.scan_radius)
+        c_lb = max(0, self._agent_location[1]-self.scan_radius)
+        c_ub = min(self.field_size-1, self._agent_location[1]+self.scan_radius)
+        for i in range(r_lb, r_ub+1):
+            for j in range(c_lb, c_ub+1):
+                self._field_discovered[i][j] = 1
+
+
+        self.steps_count += 1
+
+        terminated = self._field_discovered.all()
+        trunctated = self.steps_count >= self.max_steps
+
+        if terminated:
+            reward = 1
+        else:
+            reward = (np.sum(self._field_discovered) - np.sum(old_field) - 1)/self.field_size**2
+
+        self.total_reward += reward
         observation = self._get_obs()
         info = self._get_info()
 
         if self.render_mode == "human":
             self._render_frame()
 
-        return observation, reward, terminated, False, info
+        return observation, reward, terminated, trunctated, info
 
     def render(self):
         if self.render_mode == "rgb_array":
@@ -113,18 +131,38 @@ class GridWorldEnv(gym.Env):
         canvas = pygame.Surface((self.window_size, self.window_size))
         canvas.fill((255, 255, 255))
         pix_square_size = (
-            self.window_size / self.size
+            self.window_size / self.field_size
         )  # The size of a single grid square in pixels
 
-        # First we draw the target
-        pygame.draw.rect(
-            canvas,
-            (255, 0, 0),
-            pygame.Rect(
-                pix_square_size * self._target_location,
-                (pix_square_size, pix_square_size),
-            ),
-        )
+        # Draw discovered region
+        for i in range(self.field_size):
+            for j in range(self.field_size):
+                if self._field_discovered[i][j]:
+                    pygame.draw.rect(
+                        canvas,
+                        (127, 127, 255),
+                        pygame.Rect(
+                            pix_square_size * np.array([i,j]),
+                            (pix_square_size, pix_square_size),
+                        ),
+                    )
+
+        # Draw active scan region
+        r_lb = max(0, self._agent_location[0]-self.scan_radius)
+        r_ub = min(self.field_size-1, self._agent_location[0]+self.scan_radius)
+        c_lb = max(0, self._agent_location[1]-self.scan_radius)
+        c_ub = min(self.field_size-1, self._agent_location[1]+self.scan_radius)
+        for i in range(r_lb, r_ub+1):
+            for j in range(c_lb, c_ub+1):
+                pygame.draw.rect(
+                        canvas,
+                        (127, 255, 127,),
+                        pygame.Rect(
+                            pix_square_size * np.array([i,j]),
+                            (pix_square_size, pix_square_size),
+                        ),
+                    )
+
         # Now we draw the agent
         pygame.draw.circle(
             canvas,
@@ -134,20 +172,20 @@ class GridWorldEnv(gym.Env):
         )
 
         # Finally, add some gridlines
-        for x in range(self.size + 1):
+        for x in range(self.field_size + 1):
             pygame.draw.line(
                 canvas,
                 0,
                 (0, pix_square_size * x),
                 (self.window_size, pix_square_size * x),
-                width=3,
+                width=2,
             )
             pygame.draw.line(
                 canvas,
                 0,
                 (pix_square_size * x, 0),
                 (pix_square_size * x, self.window_size),
-                width=3,
+                width=2,
             )
 
         if self.render_mode == "human":
@@ -168,3 +206,18 @@ class GridWorldEnv(gym.Env):
         if self.window is not None:
             pygame.display.quit()
             pygame.quit()
+
+if __name__=='__main__':
+    try:
+        env = ScanWorldEnv(render_mode='human', field_size=5, scan_radius=1)
+   
+        while True:
+            obs, info = env.reset()
+            done_episode = False
+            while not done_episode:
+                action = env.action_space.sample()
+                next_obs, reward, terminated, truncated, info = env.step(action)
+                obs = next_obs
+                done_episode = terminated or truncated
+    except KeyboardInterrupt:
+        pass
